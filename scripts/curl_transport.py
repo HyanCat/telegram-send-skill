@@ -1,4 +1,4 @@
-"""Single-request transport. Importing never sends. workflow.py owns approval/journal."""
+"""Single-request transport. Importing never sends; callers own authorization."""
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -9,10 +9,13 @@ import re
 import stat
 import subprocess
 import signal
+import unicodedata
 
 CURL = "/usr/bin/curl"
 API = "https://api.telegram.org"
 REQUIRED_SEALS = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+DOCUMENT_LIMIT = 20 * 1024 * 1024
+CAPTION_LIMIT = 1024
 
 
 def load_target(path):
@@ -35,9 +38,23 @@ def load_target(path):
 
 
 def quoted(value):
-    if any(c in value for c in "\r\n\0"):
+    if "\0" in value:
         raise ValueError("CONFIG_REJECTED")
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return ('"' + value.replace("\\", "\\\\").replace('"', '\\"')
+            .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + '"')
+
+
+def document_metadata(filename, caption):
+    # Restrict curl's form syntax and avoid leaking source directories in filenames.
+    if (not isinstance(filename, str) or not filename or filename.startswith(".")
+            or filename != filename.strip() or len(filename.encode("utf-8")) > 128
+            or not filename.lower().endswith((".md", ".markdown"))
+            or not all(c.isalnum() or c in " ._()-" for c in filename)
+            or any(unicodedata.category(c).startswith("C") for c in filename)):
+        raise ValueError("DOCUMENT_FILENAME_REJECTED")
+    if (not isinstance(caption, str) or "\0" in caption
+            or len(caption.encode("utf-16-le")) // 2 > CAPTION_LIMIT):
+        raise ValueError("CAPTION_TOO_LONG_OR_INVALID")
 
 
 @contextmanager
@@ -46,15 +63,18 @@ def sealed(data=None, source=None):
     try:
         with os.fdopen(os.dup(descriptor), "wb") as output:
             if data is not None:
-                if len(data) > 20 * 1024 * 1024:
+                if len(data) > DOCUMENT_LIMIT:
                     raise ValueError("PART_TOO_LARGE")
                 output.write(data)
             else:
                 total = 0
-                with open(source, "rb") as input_file:
+                source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(source_fd, "rb") as input_file:
+                    if not stat.S_ISREG(os.fstat(input_file.fileno()).st_mode):
+                        raise ValueError("REGULAR_DOCUMENT_REQUIRED")
                     while chunk := input_file.read(65536):
                         total += len(chunk)
-                        if total > 20 * 1024 * 1024:
+                        if total > DOCUMENT_LIMIT:
                             raise ValueError("PART_TOO_LARGE")
                         output.write(chunk)
             output.flush()
@@ -65,7 +85,7 @@ def sealed(data=None, source=None):
         os.close(descriptor)
 
 
-def request_config(target, kind, descriptor):
+def request_config(target, kind, descriptor, *, filename="document.md", caption=""):
     token, chat = target["token"], target["chat_id"]
     if (not isinstance(token, str) or not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token)
             or type(chat) is not int or not chat or abs(chat) >= 2**53):
@@ -82,12 +102,16 @@ def request_config(target, kind, descriptor):
         lines += ['header = "Content-Type: application/json"',
                   "data-binary = " + quoted(f"@/proc/self/fd/{descriptor}")]
     else:
+        document_metadata(filename, caption)
         lines += ["form-string = " + quoted(f"chat_id={chat}"),
-                  "form = " + quoted(f"document=@/proc/self/fd/{descriptor};filename=approved-document.bin;type=application/octet-stream")]
+                  "form = " + quoted(f"document=@/proc/self/fd/{descriptor};filename={filename};type=text/markdown"),
+                  "form-string = " + quoted("disable_content_type_detection=true")]
+        if caption:
+            lines += ["form-string = " + quoted("caption=" + caption)]
     return ("\n".join(lines) + "\n").encode()
 
 
-def parse_result(code, stdout, expected_chat):
+def parse_result(code, stdout, expected_chat, *, kind="text"):
     # Never use stderr, URL, description or response body in the returned summary.
     try:
         body, status = stdout.rsplit(b"\nHTTP_STATUS:", 1)
@@ -96,14 +120,20 @@ def parse_result(code, stdout, expected_chat):
         if (code == 0 and http == 200 and data.get("ok") is True
                 and type(data["result"]["message_id"]) is int and data["result"]["message_id"] > 0
                 and type(data["result"]["chat"]["id"]) is int
-                and data["result"]["chat"]["id"] == expected_chat):
+                and data["result"]["chat"]["id"] == expected_chat
+                and (kind != "document" or (
+                    isinstance(data["result"]["document"]["file_id"], str)
+                    and data["result"]["document"]["file_id"]))):
             return {"state": "sent", "http_status": http, "message_id": data["result"]["message_id"]}
+        if (code == 0 and 400 <= http < 500 and data.get("ok") is False
+                and type(data.get("error_code")) is int and data["error_code"] == http):
+            return {"state": "rejected", "http_status": http, "error_code": http}
     except (ValueError, KeyError, TypeError, AttributeError):
         pass
     return {"state": "unknown"}
 
 
-def invoke(config, descriptor, expected_chat):
+def invoke(config, descriptor, expected_chat, *, kind="text"):
     process = None
     try:
         process = subprocess.Popen([CURL, "--disable", "--config", "-"], stdin=subprocess.PIPE,
@@ -111,27 +141,37 @@ def invoke(config, descriptor, expected_chat):
                                    env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
                                    pass_fds=(descriptor,), start_new_session=True)
         stdout, _ = process.communicate(config, timeout=35)
-        return parse_result(process.returncode, stdout, expected_chat)
+        return parse_result(process.returncode, stdout, expected_chat, kind=kind)
     except (OSError, subprocess.TimeoutExpired):
-        return {"state": "unknown"}
+        return {"state": "not_sent" if process is None else "unknown"}
     finally:
         # This process group is created here and contains only this curl invocation.
         if process is not None and process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
             try:
-                process.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.communicate()
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.communicate(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                # Cleanup cannot turn an attempted request into a preflight error.
+                pass
 
 
-def send_sealed(target, kind, descriptor, runner=None):
-    """Only transport; caller must validate grant, receipt, target hash and journal."""
+def send_sealed(target, kind, descriptor, runner=None, *, filename="document.md", caption=""):
+    """Only transport; caller must authorize content and the configured recipient."""
     try:
         if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & REQUIRED_SEALS != REQUIRED_SEALS:
             raise ValueError("SEALED_PART_REQUIRED")
         size = os.fstat(descriptor).st_size
-        if size > (32768 if kind == "text" else 20 * 1024 * 1024):
+        if size > (32768 if kind == "text" else DOCUMENT_LIMIT):
             raise ValueError("PART_TOO_LARGE")
         if kind == "text":
             body = json.loads(os.pread(descriptor, size, 0))
@@ -142,6 +182,16 @@ def send_sealed(target, kind, descriptor, runner=None):
             if (not isinstance(body.get("text"), str) or not body["text"]
                     or len(body["text"].encode("utf-16-le")) // 2 > 3500):
                 raise ValueError("TEXT_LIMIT")
-        return (runner or invoke)(request_config(target, kind, descriptor), descriptor, target["chat_id"])
+        elif kind == "document":
+            document_metadata(filename, caption)
+            if not size:
+                raise ValueError("DOCUMENT_EMPTY")
+            text = os.pread(descriptor, size, 0).decode("utf-8")
+            if "\0" in text:
+                raise ValueError("DOCUMENT_UTF8_REQUIRED")
+        config = request_config(target, kind, descriptor, filename=filename, caption=caption)
+        if runner is not None:
+            return runner(config, descriptor, target["chat_id"])
+        return invoke(config, descriptor, target["chat_id"], kind=kind)
     except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
         raise ValueError("PART_REJECTED") from None
